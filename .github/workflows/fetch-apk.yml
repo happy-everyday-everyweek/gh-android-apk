@@ -1,0 +1,46 @@
+name: fetch-apk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK
+        run: |
+          set -u
+          UA='Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+          urls=(
+            'https://d.apkpure.com/b/APK/com.github.android?version=latest'
+            'https://d.apkpure.com/b/XAPK/com.github.android?version=latest'
+            'https://d.apkpure.net/b/APK/com.github.android?version=latest'
+          )
+          ok=0
+          for u in "${urls[@]}"; do
+            echo "== try $u"
+            rm -f gh.apk
+            if curl -fL --retry 2 --retry-delay 3 --connect-timeout 20 --max-time 300 \
+                 -H 'Referer: https://apkpure.com/' -A "$UA" -o gh.apk "$u"; then
+              sz=$(stat -c%s gh.apk)
+              echo "size=$sz"
+              if [ "$sz" -gt 5000000 ] && unzip -l gh.apk >/dev/null 2>&1; then ok=1; break; fi
+            fi
+          done
+          if [ "$ok" != 1 ]; then echo 'download failed'; exit 1; fi
+          file gh.apk
+          unzip -l gh.apk | head -30
+          if strings gh.apk | grep -q 'com.github.android'; then echo 'package-string: OK'; else echo 'package-string: MISS'; fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="apk-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$tag" gh.apk --title "$tag" --notes 'GitHub Android APK' -R "$GITHUB_REPOSITORY"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "asset: https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/gh.apk"
