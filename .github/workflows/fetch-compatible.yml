@@ -1,0 +1,110 @@
+name: fetch-compatible
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.pick.outputs.code }}
+      name: ${{ steps.pick.outputs.name }}
+      sdk: ${{ steps.pick.outputs.sdk }}
+    steps:
+      - name: Probe versions
+        run: |
+          set -u
+          UA='Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+          AAPT="${BT}aapt2"
+          echo "aapt=$AAPT"; "$AAPT" version || true
+          : > compat.txt
+          for code in 955 900 850 800 750 700 650 600 550 500; do
+            f="v$code.bin"
+            rm -f "$f"
+            got=0
+            for p in version versionCode; do
+              if curl -fsSL --retry 2 --connect-timeout 15 --max-time 240 \
+                   -A "$UA" -H 'Referer: https://apkpure.com/' -o "$f" \
+                   "https://d.apkpure.com/b/APK/com.github.android?$p=$code"; then
+                sz=$(stat -c%s "$f")
+                if [ "$sz" -gt 15000000 ]; then got=1; break; fi
+              fi
+            done
+            if [ "$got" != 1 ]; then echo "$code - - notfound" >> compat.txt; continue; fi
+            work="x$code"; rm -rf "$work"; mkdir -p "$work"
+            if ! unzip -o -q "$f" -d "$work" 2>/dev/null; then echo "$code - - badzip" >> compat.txt; continue; fi
+            base=""
+            for cand in "$work"/com.github.android.apk "$work"/*.apk; do
+              [ -f "$cand" ] && base="$cand" && break
+            done
+            [ -n "$base" ] || base="$f"
+            if ! "$AAPT" dump badging "$base" > badge.txt 2>/dev/null; then
+              echo "$code - - aapt-fail" >> compat.txt; continue
+            fi
+            sdk=$(grep -oE "sdkVersion:'[0-9]+'" badge.txt | grep -oE '[0-9]+' | head -1)
+            vname=$(grep -oE "versionName='[^']*'" badge.txt | head -1 | cut -d\' -f2)
+            echo "$code $vname ${sdk:-0} $sz" | tee -a compat.txt
+          done
+          echo '--- compat'; cat compat.txt
+      - name: Pick newest compatible
+        id: pick
+        run: |
+          line=$(awk '$3 ~ /^[0-9]+$/ && $3 <= 31 {print; exit}' compat.txt)
+          echo "picked: $line"
+          if [ -z "$line" ]; then echo "none compatible"; exit 1; fi
+          set -- $line
+          echo "code=$1" >> "$GITHUB_OUTPUT"
+          echo "name=$2" >> "$GITHUB_OUTPUT"
+          echo "sdk=$3" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-result
+          path: compat.txt
+
+  build:
+    needs: probe
+    runs-on: ubuntu-latest
+    env:
+      CODE: ${{ needs.probe.outputs.code }}
+      VNAME: ${{ needs.probe.outputs.name }}
+      MSDK: ${{ needs.probe.outputs.sdk }}
+    steps:
+      - name: Download chosen build
+        run: |
+          set -u
+          UA='Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+          for p in version versionCode; do
+            if curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -A "$UA" -H 'Referer: https://apkpure.com/' -o pkg.zip "https://d.apkpure.com/b/APK/com.github.android?$p=$CODE"; then
+              if [ "$(stat -c%s pkg.zip)" -gt 15000000 ]; then break; fi
+            fi
+          done
+          mkdir -p splitdir && rm -rf splitdir/*
+          unzip -o -q pkg.zip -d splitdir
+          rm -f splitdir/manifest.json splitdir/*.json splitdir/*.png
+          ls -l splitdir
+      - name: Merge splits
+        run: |
+          curl -fsSL -o APKEditor.jar https://github.com/REAndroid/APKEditor/releases/latest/download/APKEditor.jar
+          java -jar APKEditor.jar m -i splitdir -o unsigned.apk
+          ls -l unsigned.apk
+      - name: Sign
+        run: |
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
+          keytool -genkeypair -keystore ks.jks -storepass android -keypass android -alias ghkey \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=GitHubMobileRepack' >/dev/null 2>&1
+          "${BT}apksigner" sign --ks ks.jks --ks-pass pass:android --key-pass pass:android \
+            --v1-signing-enabled true --v2-signing-enabled true --out "GitHub_${VNAME}_sdk${MSDK}.apk" unsigned.apk
+          "${BT}apksigner" verify --print-certs "GitHub_${VNAME}_sdk${MSDK}.apk" | head -5
+          ls -l GitHub_*.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="compat-${{ env.VNAME }}-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$tag" "GitHub_${VNAME}_sdk${MSDK}.apk" --title "$tag (minSdk ${MSDK})" \
+            --notes "merged + re-signed from versionCode ${CODE}" -R "$GITHUB_REPOSITORY"
+          echo "done: $tag"
