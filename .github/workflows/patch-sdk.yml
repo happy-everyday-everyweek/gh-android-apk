@@ -1,0 +1,74 @@
+name: patch-sdk
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest xapk
+        run: |
+          set +e
+          UA='Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -A "$UA" -H 'Referer: https://apkpure.com/' \
+            -o pkg.zip 'https://d.apkpure.com/b/APK/com.github.android?version=latest'
+          ls -l pkg.zip
+          mkdir -p splitdir; rm -f splitdir/*
+          unzip -o -q pkg.zip -d splitdir
+          rm -f splitdir/manifest.json splitdir/*.json splitdir/*.png
+          ls -l splitdir
+      - name: Merge splits
+        run: |
+          set +e
+          curl -fsSL -o APKEditor.jar https://github.com/REAndroid/APKEditor/releases/download/V1.4.9/APKEditor-1.4.9.jar
+          java -jar APKEditor.jar m -i splitdir -o merged.apk
+          ls -l merged.apk
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
+          "${BT}aapt2" dump badging merged.apk | grep -iE "package:|sdkVersion" | head -3
+      - name: Patch minSdk 32 to 31
+        run: |
+          set +e
+          curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar
+          rm -rf dec
+          java -jar apktool.jar d -f merged.apk -o dec > apktool-d.log 2>&1
+          ok=0
+          if [ -f dec/apktool.yml ]; then
+            sed -i 's/^minSdkVersion: .*/minSdkVersion: 31/' dec/apktool.yml
+            grep -n minSdkVersion dec/apktool.yml
+            java -jar apktool.jar b dec -o unsigned.apk > apktool-b.log 2>&1 && [ -f unsigned.apk ] && ok=1
+          fi
+          if [ "$ok" != 1 ]; then
+            echo 'apktool path failed, fallback to APKEditor'
+            tail -20 apktool-d.log; tail -20 apktool-b.log
+            rm -rf dec2
+            java -jar APKEditor.jar d -i merged.apk -o dec2 > ed-d.log 2>&1
+            mf=$(find dec2 -name AndroidManifest.xml | head -1)
+            echo "manifest=$mf"; grep -o 'minSdkVersion="[0-9]*"' "$mf" | head -2
+            sed -i 's/minSdkVersion="32"/minSdkVersion="31"/' "$mf"
+            java -jar APKEditor.jar b -i dec2 -o unsigned.apk > ed-b.log 2>&1 && [ -f unsigned.apk ] && ok=1
+          fi
+          [ "$ok" = 1 ] || { echo 'patch failed'; tail -20 ed-b.log; exit 1; }
+          ls -l unsigned.apk
+      - name: Sign and verify
+        run: |
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
+          keytool -genkeypair -keystore ks.jks -storepass android -keypass android -alias ghkey \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=GitHubMobileRepack' >/dev/null 2>&1
+          "${BT}apksigner" sign --ks ks.jks --ks-pass pass:android --key-pass pass:android \
+            --v1-signing-enabled true --v2-signing-enabled true --out GitHub_android12_repack.apk unsigned.apk
+          "${BT}apksigner" verify --print-certs GitHub_android12_repack.apk | head -4
+          "${BT}aapt2" dump badging GitHub_android12_repack.apk | grep -iE "package:|sdkVersion|native-code" | head -5
+          ls -l GitHub_android12_repack.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="repack-sdk31-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$tag" GitHub_android12_repack.apk \
+            --title "$tag (minSdk patched to 31)" \
+            --notes 'merged splits + minSdk 32 to 31 + re-signed debug key' -R "$GITHUB_REPOSITORY"
+          echo "done: $tag"
