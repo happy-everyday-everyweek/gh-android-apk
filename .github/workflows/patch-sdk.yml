@@ -29,30 +29,20 @@ jobs:
           ls -l merged.apk
           BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
           "${BT}aapt2" dump badging merged.apk | grep -iE "package:|sdkVersion" | head -3
-      - name: Patch minSdk 32 to 31
+      - name: Patch minSdk to 31
         run: |
           set +e
           curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar
           rm -rf dec
           java -jar apktool.jar d -f merged.apk -o dec > apktool-d.log 2>&1
-          ok=0
-          if [ -f dec/apktool.yml ]; then
-            sed -i 's/^minSdkVersion: .*/minSdkVersion: 31/' dec/apktool.yml
-            grep -n minSdkVersion dec/apktool.yml
-            java -jar apktool.jar b dec -o unsigned.apk > apktool-b.log 2>&1 && [ -f unsigned.apk ] && ok=1
-          fi
-          if [ "$ok" != 1 ]; then
-            echo 'apktool path failed, fallback to APKEditor'
-            tail -20 apktool-d.log; tail -20 apktool-b.log
-            rm -rf dec2
-            java -jar APKEditor.jar d -i merged.apk -o dec2 > ed-d.log 2>&1
-            mf=$(find dec2 -name AndroidManifest.xml | head -1)
-            echo "manifest=$mf"; grep -o 'minSdkVersion="[0-9]*"' "$mf" | head -2
-            sed -i 's/minSdkVersion="32"/minSdkVersion="31"/' "$mf"
-            java -jar APKEditor.jar b -i dec2 -o unsigned.apk > ed-b.log 2>&1 && [ -f unsigned.apk ] && ok=1
-          fi
-          [ "$ok" = 1 ] || { echo 'patch failed'; tail -20 ed-b.log; exit 1; }
-          ls -l unsigned.apk
+          [ -f dec/apktool.yml ] || { echo 'decode failed'; tail -20 apktool-d.log; exit 1; }
+          sed -i -E 's/^([[:space:]]*)minSdkVersion:.*/\1minSdkVersion: 31/' dec/apktool.yml
+          echo '--- yml sdk block'; grep -nE 'minSdkVersion|targetSdkVersion' dec/apktool.yml
+          java -jar apktool.jar b dec -o unsigned.apk > apktool-b.log 2>&1
+          [ -f unsigned.apk ] || { echo 'build failed'; tail -30 apktool-b.log; exit 1; }
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
+          echo '--- unsigned badging'; "${BT}aapt2" dump badging unsigned.apk | grep -iE 'package:|sdkVersion'
+          "${BT}aapt2" dump badging unsigned.apk | grep -q "minSdkVersion:'31'" || { echo 'minSdk still wrong'; exit 1; }
       - name: Sign and verify
         run: |
           BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/ | sort -V | tail -1)
@@ -62,6 +52,7 @@ jobs:
             --v1-signing-enabled true --v2-signing-enabled true --out GitHub_android12_repack.apk unsigned.apk
           "${BT}apksigner" verify --print-certs GitHub_android12_repack.apk | head -4
           "${BT}aapt2" dump badging GitHub_android12_repack.apk | grep -iE "package:|sdkVersion|native-code" | head -5
+          "${BT}aapt2" dump badging GitHub_android12_repack.apk | grep -q "minSdkVersion:'31'"
           ls -l GitHub_android12_repack.apk
       - name: Publish release
         env:
@@ -69,6 +60,6 @@ jobs:
         run: |
           tag="repack-sdk31-$(date +%Y%m%d-%H%M%S)"
           gh release create "$tag" GitHub_android12_repack.apk \
-            --title "$tag (minSdk patched to 31)" \
-            --notes 'merged splits + minSdk 32 to 31 + re-signed debug key' -R "$GITHUB_REPOSITORY"
+            --title "$tag (minSdk 31)" \
+            --notes 'merged splits + minSdk patched to 31 + re-signed with debug key' -R "$GITHUB_REPOSITORY"
           echo "done: $tag"
